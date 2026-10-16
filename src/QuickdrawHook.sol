@@ -63,6 +63,9 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     address internal constant PROGRAMMABLE_ROUTER = 0xd92A36B0000531EF3063dEd4De20A0783308446C; // Programmable's trading router
     address internal constant GRAPH_FACTORY = 0xB012e4A8F2c5FC4E8E4faCA9D5Ad6FfF13FBA887;       // Programmable's Graph Factory
     address internal constant ROUTER_24H = 0xBE4bF6Ac8c6F012E1C8f25747A9fBccB2FDAC4C3;          // Programmable's 24h Router
+    bytes4 internal constant MSG_SENDER_SELECTOR = 0xd737d0c7; // msgSender(): the wallet a trusted router acts for
+    // transient slot carrying a swap's authenticated buyer from beforeSwap to afterSwap (keccak256("quickdraw.hook.swapBuyer"))
+    uint256 internal constant SWAP_BUYER_SLOT = 0x5da8877fde8a3a6de0e453cd7cc6272d44774afefe8e5a5fe16267efeca06263;
     uint256 public constant SUPPLY = 100_000e18; // QuickdrawToken.SUPPLY: 100k DRAW, minted once; the caps are shares of it
 
     // QUICKDRAW-1 self-description: any tracker can recognize the game generically (ERC-165 below)
@@ -86,9 +89,8 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     // FEE_WARMUP (1 hour old), so the clock starts at max(lastEthCreditAt, firstBornAt + FEE_WARMUP); every new credit
     // to the hand (a win, or stream ETH banked by a settle) restarts it. reclaimableAt(id) gives the exact moment.
     uint64 public constant UNCLAIMED_WINDOW = 1 hours;
-    // ETH of swap volume that arms one draw (price-INDEPENDENT pacing). 0.05 ETH, PAIRED WITH the 1.5 ETH
-    // launch FDV: at a 1.5 ETH cap, 0.3 ETH per draw would freeze the street; 0.05 makes hands draw after a
-    // few buys. If you ever raise the launch FDV, raise this with it.
+    // ETH of swap volume that arms one draw (price-INDEPENDENT pacing): every 0.05 ETH traded on the ETH leg arms
+    // one draw, so the street keeps moving at any market cap.
     uint256 public constant EAT_UNIT    = 0.05 ether;
     uint8   public constant MAX_DRAIN   = 4;       // max deferred draws armed/resolved per swap (bounded catch-up)
     // COMMIT->REVEAL delay in WALL-CLOCK SECONDS. An Ethereum slot is 12s, so this is "an armed draw resolves a
@@ -106,6 +108,25 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     uint16  public constant MAX_TX_BPS     = 50;         // 0.5% of supply per single buy/transfer (500 DRAW)
     //   2) MAX WALLET: no non-excluded wallet may HOLD more than this share of supply. Until removeMaxWallet(), once.
     uint16  public constant MAX_WALLET_BPS = 200;        // 2% of supply (2,000 DRAW)
+    // THE LAUNCH PROTECTION PACKAGE, all fixed in code:
+    //  - PROTECTION_WINDOW: for 300 s after the pool opens, a buy is accepted only from an AUTHENTICATED buyer (a
+    //    trusted router whose msgSender() names the wallet, or the launcher's own initial buy naming BUYER in its
+    //    hook data), and two CUMULATIVE limits of WINDOW_LIMIT_BPS (2% = 2,000 DRAW) bind every wallet: what it
+    //    BOUGHT through swaps (windowBought) and what it RECEIVED, by buys and by ordinary transfers
+    //    (windowReceived). Selling or sending out never frees room. They bind everyone: the launch wallet, the
+    //    treasury, capAdmin and every excluded address included; only the pool side (the PoolManager) and this
+    //    hook are outside them. Game moves (draws, decay) are neither purchases nor receipts and are not counted.
+    //    During the window the exclusions bypass nothing; the two caps above apply to every recipient too.
+    //  - OPENING FEE: on BUYS the total fee is OPENING_FEE_BPS (99%) when the pool opens and falls linearly to
+    //    the normal 4.3% over OPENING_DECAY (30 s); the additional part goes to Programmable's fixed recipient
+    //    (openingFeeOwed, paid by claimPlatform). At most MAX_OPENING_FEE_EXEMPT wallets, fixed at construction,
+    //    are exempt from the additional part only: they pay 4.3% and stay bound by every limit.
+    uint64  public constant PROTECTION_WINDOW = 300;      // seconds after launchTime
+    uint16  public constant WINDOW_LIMIT_BPS  = 200;      // 2% of supply per wallet, cumulative, during the window
+    uint16  public constant OPENING_FEE_BPS   = 9900;     // the total buy fee at launchTime (99%)
+    uint64  public constant OPENING_DECAY     = 30;       // seconds for the additional part to fall to zero
+    uint256 public constant MAX_OPENING_FEE_EXEMPT = 6;
+    uint256 internal constant BASE_FEE_BPS    = 430;      // DEV_TAX_BPS + BOUNTY_FEE_BPS + PLATFORM_BPS
 
     IPoolManager public immutable poolManager;
     uint256 public cumulativeVolume;
@@ -127,6 +148,9 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     bool public maxWalletOn = true;   // 2% per-wallet cap   -> removeMaxWallet()
     uint256 public treasuryEthOwed;   // dev-tax / swept-bounty ETH accrued when the 2,300-gas push fails, awaiting sweepTreasuryEth()
     uint256 public platformOwed;      // Programmable's 0.30%, accrued here, paid by claimPlatform()
+    uint256 public openingFeeOwed;    // the additional opening buy fee (first 30 s), Programmable's; paid by claimPlatform()
+    mapping(address => uint256) public windowBought;   // DRAW bought through swaps by an authenticated buyer, in the window
+    mapping(address => uint256) public windowReceived; // DRAW received by buys and transfers, in the window
     // The treasury (the dev wallet) receives 100% of the dev tax, always in ETH, pushed in the taxed swap itself,
     // with sweepTreasuryEth() as the fallback. Excluded from the game (never a hand). Immutable.
     address public immutable treasury;
@@ -135,7 +159,14 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     // linkMirror (naming the NFT mirror once). It can NEVER raise or add a fee, move holder funds, mint, pause,
     // or change the treasury.
     address public immutable capAdmin;
-    address public immutable PLATFORM_RECIPIENT; // Programmable's fee recipient
+    address public immutable PLATFORM_RECIPIENT; // Programmable's fee recipient (the 0.30% and the opening fee)
+    // the wallets exempt from the additional opening fee only (unused slots are zero; see isOpeningFeeExempt)
+    address internal immutable EXEMPT_0;
+    address internal immutable EXEMPT_1;
+    address internal immutable EXEMPT_2;
+    address internal immutable EXEMPT_3;
+    address internal immutable EXEMPT_4;
+    address internal immutable EXEMPT_5;
     QuickdrawRenderer public immutable renderer;      // on-chain SVG, a graph target of its own
     address public immutable deployer;           // the launcher: gates afterInitialize and link()
 
@@ -153,7 +184,7 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     event EthPaid(address indexed to, uint256 amount);     // direct ETH send succeeded
     event EthEscrowed(address indexed to, uint256 amount); // recipient rejected -> pull-escrowed
     event EthEscrowClaimed(address indexed to, uint256 amount);
-    event PlatformClaimed(address indexed to, uint256 amount); // Programmable's accrued share was paid
+    event PlatformClaimed(address indexed to, uint256 amount); // Programmable's accrued share (0.30% + opening fee) was paid
     event MaxTxRemoved();     // the 0.5% per-buy cap was lifted (one-way)
     event MaxWalletRemoved(); // the 2% wallet cap was lifted (one-way)
     event TreasuryEthSwept(uint256 amount); // accrued dev-tax / swept-bounty ETH pushed to the treasury
@@ -174,17 +205,36 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     error NotCapAdmin();
     error CapAlreadyRemoved(); // a launch cap was already lifted (shared by removeMaxTx / removeMaxWallet)
     error ZeroAddress();
+    error Unauthenticated();  // a buy in the protection window from a caller that does not name an authenticated wallet
+    error BuyLimit();         // an authenticated buyer would pass 2% bought in the protection window
+    error ReceiveLimit();     // a recipient would pass 2% received in the protection window
+    error ProtectionWindow(); // a cap removal before the protection window is over
+    error TooManyExempt();    // more than MAX_OPENING_FEE_EXEMPT opening-fee-exempt wallets
 
     /// `launcher_` holds the supply, opens the pool (afterInitialize gate) and names the token (link).
     /// `capAdmin_` is the ONLY post-launch privileged address. `treasury_` receives the dev tax; excluded, immutable.
     /// `platformRecipient_` receives PLATFORM_BPS through claimPlatform(). `renderer_` draws the NFT art.
     /// `exclusions` are extra addresses that may hold DRAW without being a hand (the mainnet infrastructure is
-    /// baked in below; the token is excluded at link, the NFT mirror never holds DRAW).
+    /// baked in below; the token is excluded at link, the NFT mirror never holds DRAW). `openingFeeExempt`: at most
+    /// six wallets (the launch wallet and the team) exempt from the additional opening fee only.
     constructor(
         IPoolManager _pm, address launcher_, address capAdmin_, address treasury_, address platformRecipient_,
-        QuickdrawRenderer renderer_, address[] memory exclusions
+        QuickdrawRenderer renderer_, address[] memory exclusions, address[] memory openingFeeExempt
     ) {
         if (launcher_ == address(0) || capAdmin_ == address(0) || treasury_ == address(0) || platformRecipient_ == address(0)) revert ZeroAddress();
+        uint256 n = openingFeeExempt.length;
+        if (n > MAX_OPENING_FEE_EXEMPT) revert TooManyExempt();
+        address[6] memory e;
+        for (uint256 i = 0; i < n; i++) {
+            if (openingFeeExempt[i] == address(0)) revert ZeroAddress();
+            e[i] = openingFeeExempt[i];
+        }
+        EXEMPT_0 = e[0];
+        EXEMPT_1 = e[1];
+        EXEMPT_2 = e[2];
+        EXEMPT_3 = e[3];
+        EXEMPT_4 = e[4];
+        EXEMPT_5 = e[5];
         poolManager = _pm;
         deployer = launcher_;
         capAdmin = capAdmin_;
@@ -253,36 +303,48 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
 
     /*//////////////////// the token's two calls: balance-as-mass funnel ////////////////////*/
 
-    /// Called by the token BEFORE every transfer / transferFrom moves a balance: the two launch caps on the
-    /// recipient. A v4 buy lands as a transfer FROM the PoolManager (or a router) TO the buyer, so checking the
-    /// `to` side covers direct swaps, routers and the launcher's initial buy. Excluded infrastructure is exempt,
-    /// and because only the recipient is gated, SELLS are never restricted (a sell's `to` is the excluded pool).
+    /// Called by the token BEFORE every transfer / transferFrom moves a balance. A v4 buy lands as a transfer FROM
+    /// the PoolManager TO the buyer, so checking the `to` side covers direct swaps, routers and the launcher's
+    /// initial buy. The pool side (`to` = the PoolManager: sells, the launcher's seeding) and this hook are never
+    /// limited, so SELLS are never restricted.
+    ///   - In the PROTECTION WINDOW: what `to` has received in the window (windowReceived) may not pass 2%,
+    ///     whoever it is (exclusions bypass nothing), and the two caps below apply to every recipient.
     ///   - MAX TX     : one transfer may not exceed MAX_TX_BPS of supply. Lives until removeMaxTx() (one-way).
     ///   - MAX WALLET : a wallet may not end up holding more than MAX_WALLET_BPS of supply. Lives until
-    ///                  removeMaxWallet() (one-way). Neither is on a timer.
-    function beforeTokenTransfer(address, address to, uint256 amount) external view onlyToken {
-        if (launchTime == 0 || isExcluded[to]) return; // pre-launch, or exempt infrastructure
+    ///                  removeMaxWallet() (one-way). After the window, excluded infrastructure is exempt from both.
+    /// Game moves (gameMove / gameBurn) never come through here, so draws and decay are never counted.
+    function beforeTokenTransfer(address, address to, uint256 amount) external onlyToken {
+        uint256 opened = launchTime;
+        if (opened == 0 || to == address(poolManager) || to == address(this)) return; // pre-launch, or the pool side
+        if (block.timestamp < opened + PROTECTION_WINDOW) {
+            uint256 got = windowReceived[to] + amount;
+            if (got > SUPPLY * WINDOW_LIMIT_BPS / BPS) revert ReceiveLimit();
+            windowReceived[to] = got;
+        } else if (isExcluded[to]) {
+            return; // after the window, exempt infrastructure
+        }
         if (maxTxOn && amount > SUPPLY * MAX_TX_BPS / BPS) revert MaxTx();
         if (maxWalletOn && IQuickdrawToken(token).balanceOf(to) + amount > SUPPLY * MAX_WALLET_BPS / BPS) revert MaxWallet();
     }
-
     /// Called by the token AFTER the balance moved: resync both hands. _resync is balance-pure (no token moves,
     /// no PM interaction), so it is safe inside the v4 unlock and can never brick a transfer.
     function afterTokenTransfer(address from, address to) external onlyToken {
         _afterBalance(from, to);
     }
 
-    /// Lift the 0.5% per-buy cap, permanently. One-way, capAdmin only.
+    /// Lift the 0.5% per-buy cap, permanently. One-way, capAdmin only, never inside the protection window.
     function removeMaxTx() external {
         if (msg.sender != capAdmin) revert NotCapAdmin();
+        _afterWindow();
         if (!maxTxOn) revert CapAlreadyRemoved();
         maxTxOn = false;
         emit MaxTxRemoved();
     }
 
-    /// Lift the 2% max-wallet cap, permanently. One-way, capAdmin only.
+    /// Lift the 2% max-wallet cap, permanently. One-way, capAdmin only, never inside the protection window.
     function removeMaxWallet() external {
         if (msg.sender != capAdmin) revert NotCapAdmin();
+        _afterWindow();
         if (!maxWalletOn) revert CapAlreadyRemoved();
         maxWalletOn = false;
         emit MaxWalletRemoved();
@@ -361,9 +423,10 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     /// Anyone: pay Programmable its accrued PLATFORM_BPS share, as plain ETH. Nothing owed -> returns 0, no revert.
     /// A recipient that rejects the push leaves the amount owed (the revert restores it); nothing else is touched.
     function claimPlatform() external nonReentrant returns (uint256 amount) {
-        amount = platformOwed;
+        amount = platformOwed + openingFeeOwed; // the 0.30% leg and the opening fee, both Programmable's
         if (amount == 0) return 0;
         platformOwed = 0;
+        openingFeeOwed = 0;
         (bool ok,) = PLATFORM_RECIPIENT.call{value: amount}("");
         require(ok, "platform eth");
         emit PlatformClaimed(PLATFORM_RECIPIENT, amount);
@@ -410,22 +473,86 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     }
 
     /// Charge the ETH fee on `base` (the ETH side of the swap) with divisor `den`: BPS when the fee is a share
-    /// of the amount, BPS - bps when the swap is grossed up (exact-output sell). Takes the ETH from the
-    /// PoolManager, pushes the dev share (2.5%) to the treasury in the same tx, parks the bounty share (1.5%)
-    /// in bountyPool and accrues Programmable's share (0.30%) in platformOwed. All permanent. Returns the total
-    /// taken, i.e. the hook's delta.
-    function _takeEthFee(uint256 base, uint256 den) internal returns (uint256 total) {
+    /// of the amount, BPS - bps when the swap is grossed up (exact-output sell; exact-output buy during the
+    /// opening). Takes the ETH from the PoolManager, pushes the dev share (2.5%) to the treasury in the same tx,
+    /// parks the bounty share (1.5%) in bountyPool, accrues Programmable's share (0.30%) in platformOwed and the
+    /// additional opening fee (`extraBps`, buys in the first 30 s only) in openingFeeOwed. Returns the total taken,
+    /// i.e. the hook's delta.
+    function _takeEthFee(uint256 base, uint256 den, uint256 extraBps) internal returns (uint256 total) {
         uint256 dev = base * DEV_TAX_BPS / den;
         uint256 bounty = base * BOUNTY_FEE_BPS / den;
         uint256 platform = base * PLATFORM_BPS / den;
-        total = dev + bounty + platform;
+        uint256 opening = base * extraBps / den;
+        total = dev + bounty + platform + opening;
         if (total == 0) return 0;
         currency0.take(poolManager, address(this), total, false);
         _payTreasuryEth(dev);
         _intakeBlood(bounty);
         platformOwed += platform;
+        if (opening > 0) openingFeeOwed += opening;
     }
 
+    /*//////////////////// the launch protection package ////////////////////*/
+
+    /// True while the protection window runs (from launchTime, for PROTECTION_WINDOW seconds).
+    function _inWindow() internal view returns (bool) {
+        uint256 opened = launchTime;
+        return opened != 0 && block.timestamp < opened + PROTECTION_WINDOW;
+    }
+
+    function _afterWindow() internal view {
+        uint256 opened = launchTime;
+        if (opened == 0 || block.timestamp < opened + PROTECTION_WINDOW) revert ProtectionWindow();
+    }
+
+    /// The additional opening buy fee right now, in bps of the ETH leg, for a buyer that is not exempt: the total
+    /// buy fee is OPENING_FEE_BPS at launchTime and falls linearly to BASE_FEE_BPS at launchTime + OPENING_DECAY;
+    /// this is the part above BASE_FEE_BPS. 0 before the launch and from OPENING_DECAY on.
+    function openingFeeBps() public view returns (uint256) {
+        uint256 opened = launchTime;
+        if (opened == 0) return 0;
+        uint256 elapsed = block.timestamp - opened;
+        if (elapsed >= OPENING_DECAY) return 0;
+        return (OPENING_FEE_BPS - BASE_FEE_BPS) * (OPENING_DECAY - elapsed) / OPENING_DECAY;
+    }
+
+    /// Whether `wallet` is one of the (at most six) wallets exempt from the additional opening fee.
+    function isOpeningFeeExempt(address wallet) public view returns (bool) {
+        return wallet != address(0) && (wallet == EXEMPT_0 || wallet == EXEMPT_1 || wallet == EXEMPT_2
+            || wallet == EXEMPT_3 || wallet == EXEMPT_4 || wallet == EXEMPT_5);
+    }
+
+    /// The authenticated buyer of a swap: the wallet the launcher names in its hook data (its own initial buy), or
+    /// the wallet a trusted router names through msgSender(). Zero for anyone else.
+    function _buyer(address sender, bytes calldata hookData) internal view returns (address wallet) {
+        if (sender == deployer) {
+            if (hookData.length == 32) {
+                uint256 v = abi.decode(hookData, (uint256));
+                if (v <= type(uint160).max) wallet = address(uint160(v));
+            }
+        } else if (sender == UNIVERSAL_ROUTER || sender == UNIVERSAL_ROUTER_2 || sender == PROGRAMMABLE_ROUTER) {
+            wallet = _callerOf(sender);
+        }
+    }
+
+    /// The wallet a router says it acts for (msgSender()), read with a bounded call that never reverts: zero when
+    /// the router does not answer, answers with something else than one word, or names an impossible address.
+    function _callerOf(address router) internal view returns (address w) {
+        (bool ok, bytes memory ret) = router.staticcall{gas: 30_000}(abi.encodeWithSelector(MSG_SENDER_SELECTOR));
+        if (!ok || ret.length != 32) return address(0);
+        uint256 v = abi.decode(ret, (uint256));
+        if (v <= type(uint160).max) w = address(uint160(v));
+    }
+
+    /// The buyer of the swap in flight, carried from beforeSwap to afterSwap in transient storage (one swap at a
+    /// time per hook call pair; beforeSwap always writes it for a buy).
+    function _setSwapBuyer(address wallet) internal {
+        assembly ("memory-safe") { tstore(SWAP_BUYER_SLOT, wallet) }
+    }
+
+    function _swapBuyer() internal view returns (address wallet) {
+        assembly ("memory-safe") { wallet := tload(SWAP_BUYER_SLOT) }
+    }
     /*//////////////////// ERC-721 mirror bridge (IQuickdrawBase) ////////////////////*/
 
     function _onHandMint(uint256 id, address owner) internal override {
@@ -602,21 +729,45 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         int128 a0 = delta.amount0();
         int128 a1 = delta.amount1();
         uint256 ethVol = uint256(int256(a0 < 0 ? -a0 : a0)); // ETH-side volume drives the draw (price-independent)
+        bool buy = params.zeroForOne; // currency0 is ETH: a buy pays ETH for DRAW
 
         // The hook may only return a delta in the v4 UNSPECIFIED slot, so the fee is taken there. The
         // unspecified currency is DRAW when (zeroForOne == exactInput); its delta is the OUTPUT for an
         // exact-in swap (positive) or the INPUT for an exact-out swap (negative). We fee its MAGNITUDE so
         // exact-output swaps can no longer slip through fee-free.
-        bool unspecIsDraw = (params.zeroForOne == (params.amountSpecified < 0));
+        bool unspecIsDraw = (buy == (params.amountSpecified < 0));
         int128 unspecAmt = unspecIsDraw ? a1 : a0;
         uint256 feeBase = uint256(int256(unspecAmt < 0 ? -unspecAmt : unspecAmt));
 
         // THE FEE IS NEVER TAKEN IN DRAW. `unspecIsDraw` true means ETH was the SPECIFIED currency, so
         // beforeSwap already charged the ETH fee; charging again here would double-bill.
         int128 hookDelta = 0;
-        if (!unspecIsDraw) hookDelta = int128(uint128(_takeEthFee(feeBase, BPS)));
+        if (!unspecIsDraw) {
+            if (buy) {
+                // exact-output BUY: during the opening the fee is grossed up so that it is the stated share of what
+                // the buyer pays, exactly like an exact-input buy (fee = net * bps / (BPS - bps)); afterwards the
+                // normal fee is a share of the pool's ETH input, as always.
+                uint256 extra = _extraFor(_swapBuyer());
+                uint256 den = extra == 0 ? BPS : BPS - BASE_FEE_BPS - extra;
+                hookDelta = int128(uint128(_takeEthFee(feeBase, den, extra)));
+            } else {
+                hookDelta = int128(uint128(_takeEthFee(feeBase, BPS, 0))); // exact-input SELL: normal fee only
+            }
+        }
+        // the protection window: the authenticated buyer's cumulative purchases (a buy's DRAW is a1 > 0)
+        if (buy && _inWindow()) {
+            address wallet = _swapBuyer();
+            uint256 had = windowBought[wallet] + uint256(int256(a1));
+            if (had > SUPPLY * WINDOW_LIMIT_BPS / BPS) revert BuyLimit();
+            windowBought[wallet] = had;
+        }
         _processSwap(ethVol);
         return (IHooks.afterSwap.selector, hookDelta);
+    }
+
+    /// The additional opening fee for this buyer right now: 0 for an exempt wallet.
+    function _extraFor(address wallet) internal view returns (uint256) {
+        return isOpeningFeeExempt(wallet) ? 0 : openingFeeBps();
     }
 
     // Unused callbacks: their flags are OFF in the mined address, so v4 never calls them.
@@ -633,18 +784,28 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     /// INPUT here instead, before the swap runs: v4 computes `amountToSwap += hookDeltaSpecified`, so a POSITIVE
     /// specified delta on an exact-input swap shrinks the input that reaches the pool by exactly what this hook
     /// took. Fires for the two modes where ETH is the SPECIFIED currency (exact-input buy, exact-output sell).
-    function beforeSwap(address, PoolKey calldata, SwapParams calldata params, bytes calldata)
+    function beforeSwap(address sender, PoolKey calldata, SwapParams calldata params, bytes calldata hookData)
         external onlyPM returns (bytes4, BeforeSwapDelta, uint24)
     {
-        if (params.zeroForOne == (params.amountSpecified < 0)) {
+        bool buy = params.zeroForOne;
+        if (buy) {
+            // the protection window: only an authenticated buyer may buy; carry the wallet to afterSwap
+            address wallet;
+            if (_inWindow()) {
+                wallet = _buyer(sender, hookData);
+                if (wallet == address(0)) revert Unauthenticated();
+            }
+            _setSwapBuyer(wallet);
+        }
+        if (buy == (params.amountSpecified < 0)) {
             uint256 total;
-            if (params.amountSpecified < 0) {
-                // exact-input BUY: bps/BPS of the ETH the trader put in
-                total = _takeEthFee(uint256(-params.amountSpecified), BPS);
+            if (buy) {
+                // exact-input BUY: bps/BPS of the ETH the trader put in; in the first 30 s the opening part on top
+                total = _takeEthFee(uint256(-params.amountSpecified), BPS, _extraFor(_swapBuyer()));
             } else {
                 // exact-output SELL: the trader demands X ETH out. Gross the swap up to X + fee so that the fee
-                // is bps/BPS of what the pool actually releases: fee = X * bps / (BPS - bps).
-                total = _takeEthFee(uint256(params.amountSpecified), BPS - DEV_TAX_BPS - BOUNTY_FEE_BPS - PLATFORM_BPS);
+                // is bps/BPS of what the pool actually releases: fee = X * bps / (BPS - bps). Sells pay the normal fee.
+                total = _takeEthFee(uint256(params.amountSpecified), BPS - BASE_FEE_BPS, 0);
             }
             if (total > 0) return (IHooks.beforeSwap.selector, toBeforeSwapDelta(int128(uint128(total)), 0), 0);
         }
@@ -661,8 +822,8 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     }
 
     /// The ETH the bloodstream owns: the un-paid-out wei (`ethIn - ethOut`: banked wins + parked bounty +
-    /// spores owed) plus the pull-escrow bucket. platformOwed and treasuryEthOwed are separate liabilities;
-    /// address(this).balance always covers all three.
+    /// spores owed) plus the pull-escrow bucket. platformOwed, openingFeeOwed and treasuryEthOwed are separate
+    /// liabilities; address(this).balance always covers all four.
     function bloodReserve() public view override returns (uint256) {
         return (ethIn - ethOut) + ethEscrowTotal;
     }

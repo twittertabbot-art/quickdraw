@@ -6,7 +6,7 @@ import {ERC20} from "solmate/src/tokens/ERC20.sol";
 /// The hook, as the token sees it: asked before every transfer (the two launch caps and the exclusions) and told
 /// after it (the resync that turns a balance into a hand on the street).
 interface IQuickdrawGame {
-    function beforeTokenTransfer(address from, address to, uint256 amount) external view;
+    function beforeTokenTransfer(address from, address to, uint256 amount) external;
     function afterTokenTransfer(address from, address to) external;
 }
 

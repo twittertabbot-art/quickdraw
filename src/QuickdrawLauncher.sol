@@ -15,10 +15,20 @@ pragma solidity ^0.8.26;
   use. There is no function that removes the position: the liquidity can never leave. Rounding dust stays here.
   The launcher is excluded from the game (baked into the hook), so the dust is never a hand on the street.
 
-  The initial buy lands on BUYER through the token's transfer path, so the hook's launch caps apply to it like to
-  any buyer: it can never exceed 0.5% of supply. The same contract serves a direct launch (tests, or a launch
-  without Programmable): whoever is INITIALIZER calls initializeGraph() after deploying the token and the hook.
+  The initial buy names BUYER in its hook data (the hook trusts that only from this launcher) and lands on BUYER
+  through the token's transfer path, so the hook's limits apply to it like to any buyer: at most 0.5% of supply in
+  one buy, 2% bought and 2% received in the protection window. The same contract serves a direct launch (tests, or
+  a launch without Programmable): whoever is INITIALIZER calls initializeGraph() after deploying the token and hook.
+
+  THE OPENING PRICE CHECK: before the pool opens, the FDV of the whole supply at INITIAL_TICK, valued with a fresh
+  answer of the Chainlink ETH/USD feed (ETH_USD_FEED, fixed at construction), must be at least
+  MIN_OPENING_FDV_USD. The feed answer must be positive, from a complete round, and no older than MAX_PRICE_AGE.
 */
+
+/// Chainlink's aggregator read: latestRoundData() of an 8-decimal ETH/USD feed.
+interface IEthUsdFeed {
+    function latestRoundData() external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
@@ -30,6 +40,7 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {QuickdrawToken} from "./QuickdrawToken.sol";
 
 interface IQuickdrawHookLink {
@@ -48,7 +59,11 @@ contract QuickdrawLauncher is IUnlockCallback {
             | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
     );
 
+    uint256 public constant MIN_OPENING_FDV_USD = 15_000; // the whole supply, at INITIAL_TICK, in USD
+    uint256 public constant MAX_PRICE_AGE = 4_200;        // seconds: the feed's one-hour heartbeat plus ten minutes of slack
+
     IPoolManager public immutable poolManager;
+    address public immutable ETH_USD_FEED; // Chainlink ETH/USD (8 decimals); on Ethereum mainnet 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419
     address public immutable INITIALIZER; // Programmable's Graph Factory (or the deployer in a direct launch)
     int24 public immutable INITIAL_TICK; // multiple of 60: the start price (currency1 = DRAW per ETH)
     address public immutable BUYER; // the launch wallet: receives the initial buy and the refund
@@ -74,11 +89,16 @@ contract QuickdrawLauncher is IUnlockCallback {
     error BuyValue();
     error BuyShape();
     error RefundFailed();
+    error StalePrice();       // the feed answer is too old, from the future, or from an incomplete round
+    error BadPrice();         // the feed answered zero or a negative price
+    error OpeningFdvTooLow(); // the FDV at INITIAL_TICK is below MIN_OPENING_FDV_USD
 
-    constructor(address poolManager_, address initializer, int24 initialTick, address buyer, uint256 initialBuyTokens) {
+    constructor(address poolManager_, address initializer, int24 initialTick, address buyer, uint256 initialBuyTokens, address ethUsdFeed) {
         if (initialTick % TICK_SPACING != 0 || initialTick <= TickMath.minUsableTick(TICK_SPACING) || initialTick >= TickMath.maxUsableTick(TICK_SPACING)) revert BadTick();
         if (initialBuyTokens != 0 && buyer == address(0)) revert NoBuyer();
         if (initialBuyTokens >= SUPPLY) revert BuyValue();
+        if (ethUsdFeed == address(0)) revert NotDeployed(ethUsdFeed);
+        ETH_USD_FEED = ethUsdFeed;
         poolManager = IPoolManager(poolManager_);
         INITIALIZER = initializer;
         INITIAL_TICK = initialTick;
@@ -99,6 +119,19 @@ contract QuickdrawLauncher is IUnlockCallback {
         return PoolId.unwrap(_key.toId());
     }
 
+    /// The FDV of the whole supply at INITIAL_TICK, in USD with 8 decimals, from a fresh feed answer. Reverts on a
+    /// stale or incomplete round (StalePrice) or a non-positive answer (BadPrice).
+    function openingFdvUsdE8() public view returns (uint256) {
+        (uint80 roundId, int256 answer,, uint256 updatedAt, uint80 answeredInRound) = IEthUsdFeed(ETH_USD_FEED).latestRoundData();
+        if (answer <= 0) revert BadPrice();
+        if (updatedAt > block.timestamp || block.timestamp - updatedAt > MAX_PRICE_AGE || answeredInRound < roundId) revert StalePrice();
+        // currency0 = ETH, currency1 = DRAW: price = DRAW per ETH = sqrtP^2 / 2^192, so the whole supply is worth
+        // SUPPLY * 2^192 / sqrtP^2 wei of ETH (both 18 decimals), and that times the 8-decimal USD answer / 1e18.
+        uint256 sqrtP = TickMath.getSqrtPriceAtTick(INITIAL_TICK);
+        uint256 fdvWei = FullMath.mulDiv(FullMath.mulDiv(SUPPLY, 1 << 96, sqrtP), 1 << 96, sqrtP); // no sqrtP^2 overflow at any tick
+        return FullMath.mulDiv(fdvWei, uint256(answer), 1e18);
+    }
+
     /// Called once by the initializer after the token and the hook exist. Links the token into the hook, opens the
     /// pool, fills it, makes the initial buy with the ETH it was sent (all of it is the budget; the rest goes back
     /// to BUYER).
@@ -117,6 +150,8 @@ contract QuickdrawLauncher is IUnlockCallback {
         // native ETH is always currency0
         _key = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(token_), fee: LP_FEE, tickSpacing: TICK_SPACING, hooks: IHooks(hook_)});
 
+        // the opening price check, before the pool exists: at least MIN_OPENING_FDV_USD at a fresh ETH/USD answer
+        if (openingFdvUsdE8() < MIN_OPENING_FDV_USD * 1e8) revert OpeningFdvTooLow();
         poolManager.initialize(_key, TickMath.getSqrtPriceAtTick(INITIAL_TICK));
         bytes memory out = poolManager.unlock(abi.encode(msg.value));
         (uint256 liquidity, uint256 paid) = abi.decode(out, (uint256, uint256));
@@ -151,10 +186,11 @@ contract QuickdrawLauncher is IUnlockCallback {
 
         uint256 paid;
         if (value != 0) {
-            // the initial buy: exactly INITIAL_BUY_TOKENS for BUYER. The hook takes its ETH fee on the leg; the
-            // DRAW reaches BUYER through the token's transfer path, so the launch caps apply to it like to anyone.
+            // the initial buy: exactly INITIAL_BUY_TOKENS for BUYER, named in the hook data (the hook's authenticated
+            // buyer for this swap). The hook takes its ETH fee on the leg; the DRAW reaches BUYER through the token's
+            // transfer path, so the hook's limits apply to it like to anyone.
             BalanceDelta s = poolManager.swap(
-                _key, SwapParams({zeroForOne: true, amountSpecified: int256(INITIAL_BUY_TOKENS), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}), ""
+                _key, SwapParams({zeroForOne: true, amountSpecified: int256(INITIAL_BUY_TOKENS), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}), abi.encode(BUYER)
             );
             if (s.amount0() >= 0 || s.amount1() <= 0 || uint256(uint128(s.amount1())) != INITIAL_BUY_TOKENS) revert BuyShape();
             paid = uint256(uint128(-s.amount0()));

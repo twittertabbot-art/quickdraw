@@ -19,6 +19,13 @@ Website: https://quickdrawprotocol.xyz
 
 The files under `lib/` are the exact Uniswap v4 and solmate sources the contracts import.
 
+## Launch protection
+
+For the first 300 seconds after launch, every wallet may buy at most 2% of the supply and receive at most 2%, counted
+cumulatively, and buys must come through an authenticated router. The buy fee opens at 99% and falls linearly to the
+normal fee over 30 seconds; the extra goes to Programmable's fixed treasury. The launcher only opens the pool at a
+market cap of at least $15,000, checked against the Chainlink ETH/USD feed.
+
 ## Build settings
 
 solc 0.8.26, EVM cancun, optimizer 200 runs, via-IR, no metadata hash, no CBOR metadata. Import paths are in

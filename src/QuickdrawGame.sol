@@ -14,16 +14,16 @@ pragma solidity ^0.8.26;
 
   This contract is deliberately inert: no token transfers, no Uniswap, no ETH custody, so the dangerous part,
   the draw, fuzzes in isolation. `QuickdrawHook` inherits it and wires in the real DRAW moves (`_moveMass` /
-  `_burnMass` / `_payout`, the balance read `_holderBalance`) and the v4 swap feed.
+  `_burnMass`, the balance read `_holderBalance`) and the v4 swap feed.
 
   Two structural choices carry everything:
     - O(1), always. Hands sit in power-of-two mass buckets (bucket = msb(mass)); one uint256 bitmap flags the
       non-empty ones, so a near-peer winner/loser pair is a single bit-scan, insert is a push, remove is
       swap-and-pop. No loop ever scales with the holder count. The handId IS uint160(owner): one wallet, one
       hand, keyed by its own address.
-    - Two MasterChef accumulators, run wei-exact. `accEthPerMass` re-apportions a husk's forfeited won ETH to
-      survivors (no fee streams to holders); `accFeePerMass` is its DRAW twin, present but always 0 because
-      there is no token-side fee (holders are paid in ETH, never in DRAW). Flash-staking is dead: `bornAt`
+    - One MasterChef accumulator, run wei-exact. `accEthPerMass` re-apportions a husk's forfeited won ETH to
+      survivors (no fee streams to holders). There is no DRAW twin: there is no token-side fee (holders are
+      paid in ETH, never in DRAW), so the always-zero DRAW fee stream was removed (2026-10-17). Flash-staking is dead: `bornAt`
       resets on every (re)activation, claims open only past FEE_WARMUP, and a hand that husks FORFEITS what
       it never claimed to the survivors. Claim before you leave.
 
@@ -129,7 +129,7 @@ abstract contract QuickdrawGame {
     mapping(uint256 => uint128) public peak;
     mapping(uint16 => uint256[]) internal bucketHands; // bucket => handIds
     uint256 internal bitmap;                            // bit b set iff bucket b non-empty
-    mapping(address => bool) public isExcluded;         // PoolManager/hook/DEAD/launcher: never a hand
+    mapping(address => bool) public isExcluded;         // PoolManager/hook/DEAD/initializer/children: never a hand
 
     // â”€â”€ live-mass bookkeeping (Î£ of all live hand masses; the fee/eth accumulators divide by it) â”€â”€
     uint256 public liveMass;     // maintained ONLY in _resync (+activate / -deactivate / Â±re-mass)
@@ -138,13 +138,6 @@ abstract contract QuickdrawGame {
     // â”€â”€ O(1) UI counters (so the website reads the whole header from the CA, no event-log scans) â”€â”€
     uint256 public liveHands;    // count of hands currently on the board (alive); maintained in _resync
     uint256 public totalEats;    // cumulative successful eats (global); bumped once per eat in _eat
-
-    // â”€â”€ fee engine (DRAW apex fees, held by the hook, claimed by hands) â”€â”€
-    uint256 public accFeePerMass;                  // ACC_PREC-scaled fee per unit mass
-    mapping(uint256 => uint256) public feeDebt;    // handId => accounted-for fees (UN-divided = mass*acc)
-    mapping(uint256 => uint256) public claimable;  // handId => settled, unclaimed fees
-    uint256 public totalFeesIn;                    // cumulative fees distributed in
-    uint256 public totalFeesOut;                   // cumulative fees claimed/paid/forfeit-realized out
 
     // â”€â”€ BLOODSTREAM ETH survival stream (the v4-exclusive moat) â”€â”€
     // A wei-exact twin of the fee engine. SINGLE SOURCE OF TRUTH is (ethIn, ethOut) , 
@@ -189,8 +182,6 @@ abstract contract QuickdrawGame {
     function _moveMass(address from, address to, uint256 amount) internal virtual;
     /// RAW burn from a holder (NO _resync, NO DEAD-address balance): decrements balance + totalSupply.
     function _burnMass(address from, uint256 amount) internal virtual;
-    /// Pay $DRAW out of the hook's fee reserve to `to`, THEN resync `to` (claimed fees become mass).
-    function _payout(address to, uint256 amount) internal virtual;
 
     // NFT-mirror lifecycle hooks (default no-op; QuickdrawHook emits ERC-721 events through them)
     function _onHandMint(uint256 id, address owner) internal virtual {}
@@ -256,35 +247,6 @@ abstract contract QuickdrawGame {
         unchecked { liveHands -= 1; } // off the board (eaten/husked/shrunk away)
     }
 
-    /*//////////////////////////// fee engine ////////////////////////////*/
-
-    /// Route NEW `amount` of fees to all live mass pro-rata (counts as fees-in).
-    function _distribute(uint256 amount) internal {
-        if (amount == 0 || liveMass == 0) return;
-        accFeePerMass += amount * ACC_PREC / liveMass;
-        totalFeesIn += amount;
-    }
-
-    /// Re-apportion ALREADY-escrowed fees (forfeited by a hand dropping to a HUSK) to survivors.
-    /// Does NOT bump totalFeesIn, the tokens are already in the hook, just re-owed. No survivors ->
-    /// the fees stay orphaned in the fee reserve (kept solvent).
-    function _reapportion(uint256 amount) internal {
-        if (amount == 0 || liveMass == 0) return;
-        accFeePerMass += amount * ACC_PREC / liveMass;
-    }
-
-    // feeDebt is stored UN-divided (mass*acc) so pending uses a single floor, the canonical MasterChef
-    // form, guaranteeing Î£ pending <= Î£ distributed (no dust leak).
-    function _pending(uint256 id) internal view returns (uint256) {
-        return (uint256(hands[id].mass) * accFeePerMass - feeDebt[id]) / ACC_PREC;
-    }
-
-    /// Move a hand's accrued fees into its claimable bucket and re-baseline its debt.
-    function _settleFees(uint256 id) internal {
-        claimable[id] += _pending(id);
-        feeDebt[id] = uint256(hands[id].mass) * accFeePerMass;
-    }
-
     /*//////////////////////// BLOODSTREAM ETH engine ////////////////////////*/
     /* A wei-exact twin of the fee engine. Intake is parked in bountyPool (nothing streams on intake);
        accEthPerMass only re-apportions a husk's forfeited kill ETH to survivors. Egress is transfer-free
@@ -334,7 +296,6 @@ abstract contract QuickdrawGame {
     /// Change a live hand's mass: settle fees+ETH at the old mass, re-bucket if needed, set the new
     /// mass, re-baseline both debts. Does NOT touch liveMass, `_resync` owns that.
     function _changeMass(uint256 id, uint128 newMass) internal {
-        _settleFees(id);
         _settleEth(id);
         Hand storage c = hands[id];
         bool inB = (c.bucket != NO_BUCKET);
@@ -348,7 +309,6 @@ abstract contract QuickdrawGame {
             else if (nb != c.bucket) { _removeFromBucket(id); c.mass = newMass; _insert(id); }
             else { c.mass = newMass; }
         }
-        feeDebt[id] = uint256(newMass) * accFeePerMass;
         ethDebt[id] = uint256(newMass) * accEthPerMass;
     }
 
@@ -388,7 +348,6 @@ abstract contract QuickdrawGame {
             if (firstBornAt[id] == 0) firstBornAt[id] = uint64(block.timestamp); // once-ever; survives husk+rebuy
             c.lastTouch = uint64(block.timestamp);
             c.alive = true;
-            feeDebt[id] = uint256(eatable) * accFeePerMass; // earns only from now on (un-divided baseline)
             ethDebt[id] = uint256(eatable) * accEthPerMass;
             _insert(id); // _insert maintains liveHands (+1)
             liveMass += eatable;
@@ -400,29 +359,7 @@ abstract contract QuickdrawGame {
         }
 
         if (wasAlive && !shouldLive) {
-            // DEACTIVATE -> HUSK: settle, then forfeit unclaimed fees + stream ETH to survivors.
-            // Warm or cold, exit forfeits (claim before you sell). Solvent: fees re-owed without an
-            // income bump; ETH re-streamed (or parked) without an ethIn bump.
-            _settleFees(id);
-            uint256 f = claimable[id];
-            claimable[id] = 0;
-            _settleEth(id);
-            uint256 e = handEth[id];
-            if (e > 0) { handEth[id] = 0; handEthTotal -= e; }
-            uint128 lost = c.mass;
-            if (c.bucket != NO_BUCKET) _removeFromBucket(id); // skip if already off-board at mass 0 (maintains liveHands)
-            c.bucket = NO_BUCKET;
-            liveMass -= lost; // lost == 0 if it was already off-board
-            c.mass = 0;
-            c.alive = false;
-            peak[id] = 0;    // reset the floor high-water so a re-buy starts fresh (no stale giant floor)
-            feeDebt[id] = 0; // a husk earns nothing; zero the baselines so views never underflow on it
-            ethDebt[id] = 0;
-            // re-owe to survivors (mass already off the board, so it lands on others only)
-            if (f > 0) _reapportion(f);
-            if (e > 0) { if (liveMass > 0) _reapportionEth(e); else bountyPool += e; }
-            emit Husked(id, addr, lost, f, e);
-            _onHandBurn(id, addr);
+            _husk(id, addr);
             return;
         }
 
@@ -431,6 +368,28 @@ abstract contract QuickdrawGame {
         _changeMass(id, eatable);
         if (eatable >= oldMass) liveMass += (eatable - oldMass);
         else liveMass -= (oldMass - eatable);
+    }
+
+    /// DEACTIVATE -> HUSK: settle, then forfeit unclaimed stream ETH to survivors. Warm or cold, exit forfeits
+    /// (claim before you sell). Solvent: ETH re-streamed (or parked) without an ethIn bump. Reached from _resync when
+    /// a balance falls to the hard floor, and from QuickdrawHook.excludeFromGame (the same rules, applied at once).
+    function _husk(uint256 id, address addr) internal {
+        Hand storage c = hands[id];
+        _settleEth(id);
+        uint256 e = handEth[id];
+        if (e > 0) { handEth[id] = 0; handEthTotal -= e; }
+        uint128 lost = c.mass;
+        if (c.bucket != NO_BUCKET) _removeFromBucket(id); // skip if already off-board at mass 0 (maintains liveHands)
+        c.bucket = NO_BUCKET;
+        liveMass -= lost; // lost == 0 if it was already off-board
+        c.mass = 0;
+        c.alive = false;
+        peak[id] = 0;    // reset the floor high-water so a re-buy starts fresh (no stale giant floor)
+        ethDebt[id] = 0; // a husk earns nothing; zero the baseline so views never underflow on it
+        // re-owe to survivors (mass already off the board, so it lands on others only)
+        if (e > 0) { if (liveMass > 0) _reapportionEth(e); else bountyPool += e; }
+        emit Husked(id, addr, lost, 0, e);
+        _onHandBurn(id, addr);
     }
 
     /// Resync both endpoints of a transfer (called by QuickdrawHook after a balance move). O(1).
@@ -475,11 +434,7 @@ abstract contract QuickdrawGame {
         if (block.timestamp < uint256(firstBornAt[id]) + FEE_WARMUP) revert NotWarm();
         _touch(id);
         if (!c.alive) return 0; // decay husked it; nothing to claim (fees were forfeited)
-        _settleFees(id);
         _settleEth(id); // bank pending ETH into handEth so it survives later mass changes
-        fees = claimable[id];
-        claimable[id] = 0;
-        totalFeesOut += fees;
         emit Claimed(id, c.owner, fees);
     }
 
@@ -561,11 +516,6 @@ abstract contract QuickdrawGame {
         address preyAddr = hands[preyId].owner;
         address predAddr = hands[predId].owner;
 
-        // settle + clear the prey's accrued DRAW fees (always 0: there is no token-side fee)
-        _settleFees(preyId);
-        uint256 preyFees = claimable[preyId];
-        claimable[preyId] = 0;
-
         // settle the prey's banked stream ETH (about to be inherited / spored / recycled)
         _settleEth(preyId);
         uint256 preyEth = handEth[preyId];
@@ -593,7 +543,6 @@ abstract contract QuickdrawGame {
         if (burn > 0) _burnMass(preyAddr, burn);
         totalSpored += spore;
         totalBurned += burn;
-        if (preyFees > 0) totalFeesOut += preyFees;
 
         // â”€â”€ reconcile both hands from their new balances (predator grew, prey knocked down / husked).
         // _resync is balance-pure, so doing it AFTER both raw moves keeps the buckets coherent.
@@ -637,8 +586,6 @@ abstract contract QuickdrawGame {
         emit Eaten(predId, preyId, pm, burn, spore, hands[predId].mass);
         emit BloodEaten(predId, preyId, ethInherit, ethSpore, prize);
 
-        // pay the prey its earned fees last (raw credit + resync -> becomes mass; may re-grow the prey)
-        if (preyFees > 0) _payout(preyAddr, preyFees);
     }
 
     /*////////////////////////////// views //////////////////////////////*/

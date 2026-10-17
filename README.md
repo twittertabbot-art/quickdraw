@@ -10,21 +10,26 @@ Website: https://quickdrawprotocol.xyz
 
 | File | Contract | Role |
 |---|---|---|
-| `src/QuickdrawToken.sol` | QuickdrawToken | the DRAW token, 100,000 supply minted once |
-| `src/QuickdrawHook.sol` | QuickdrawHook | the Uniswap v4 hook: fees on the ETH leg, launch caps, the game |
+| `src/QuickdrawToken.sol` | QuickdrawToken | the DRAW token, 100,000 supply minted once, with the launch-protection inflow budget |
+| `src/QuickdrawHook.sol` | QuickdrawHook | the Uniswap v4 hook: the protected fee kernel and the game |
 | `src/QuickdrawGame.sol` | QuickdrawGame | the game engine the hook runs: hands, draws, shields, floors |
-| `src/QuickdrawLauncher.sol` | QuickdrawLauncher | opens the native ETH / DRAW pool and holds its liquidity forever |
 | `src/QuickdrawNFT.sol` | QuickdrawNFT | a soulbound mirror of every hand |
 | `src/QuickdrawRenderer.sol` | QuickdrawRenderer | the on-chain token art |
+| `src/launch-protection/ProtectedNativeInitializerV1.sol` | ProtectedNativeInitializerV1 | opens the pool, locks its liquidity, checks the opening value and makes the initial buy |
+| `src/launch-protection/LaunchProtectionModuleV1.sol` | LaunchProtectionModuleV1 | buyer authentication and the opening fee schedule |
+| `src/ethereum-native30-v3/EthereumNativeFeeVaultV3.sol` | EthereumNativeFeeVaultV3 | the normal fee vault and the opening-tax vault |
 
-The files under `lib/` are the exact Uniswap v4 and solmate sources the contracts import.
+The initializer, the protection module, the fee vault and `ProtectedLaunchTokenV1.sol` (used as a type) are
+Programmable's launch-protection v1 sources, unchanged. The files under `lib/` are the exact Uniswap v4, solmate and
+OpenZeppelin sources the contracts import.
 
 ## Launch protection
 
-For the first 300 seconds after launch, every wallet may buy at most 2% of the supply and receive at most 2%, counted
-cumulatively, and buys must come through an authenticated router. The buy fee opens at 99% and falls linearly to the
-normal fee over 30 seconds; the extra goes to Programmable's fixed treasury. The launcher only opens the pool at a
-market cap of at least $15,000, checked against the Chainlink ETH/USD feed.
+For the first 300 seconds after launch, every wallet may receive at most 2% of the supply and every authenticated buyer
+may buy at most 2%, counted cumulatively. Buys during that window go through Programmable's router. The buy fee opens
+at 99% and falls linearly to the normal fee over 30 seconds; the extra goes to the opening-tax vault, payable only to
+Programmable's treasury. The pool opens only at a value of at least $15,000, checked against the Chainlink ETH/USD
+feed.
 
 ## Build settings
 

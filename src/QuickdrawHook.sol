@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 import {QuickdrawGame} from "./QuickdrawGame.sol";
 import {QuickdrawNFT} from "./QuickdrawNFT.sol";
 import {QuickdrawRenderer} from "./QuickdrawRenderer.sol";
-import {LaunchProtectionModuleV1} from "./launch-protection/LaunchProtectionModuleV1.sol";
+import {BaseLaunchProtectionModuleV1} from "./base-custom-v1/BaseLaunchProtectionModuleV1.sol";
 import {ProtectedLaunchTokenV1} from "./launch-protection/ProtectedLaunchTokenV1.sol";
 import {EthereumNativeFeeVaultV3} from "./ethereum-native30-v3/EthereumNativeFeeVaultV3.sol";
 
@@ -54,14 +54,14 @@ interface IProtectedNativeFeeModuleV1 {
   KERNEL of the one native ETH / DRAW pool, built on Programmable's protected launch package (launch protection v1).
 
   THE KERNEL mirrors Programmable's ProtectedNative30HookV1 swap path line for line:
-    - beforeInitialize: only the fixed initializer (ProtectedNativeInitializerV1) may open the exact bound PoolKey,
+    - beforeInitialize: only the fixed initializer (BaseProtectedNativeInitializerV1) may open the exact bound PoolKey,
       once, at initialSqrtPriceX96.
     - the fee is charged on the native leg, gross, rounded UP per trade, in all four swap shapes
       (quoteFees / previewTradeFees / _quoteTradeFees, the same maths): the 30-bps platform fee
       ceil(gross * 30 / 10000), the normal total ceil(gross * 430 / 10000) (PLATFORM_FEE_BPS + CREATOR_FEE_BPS), and
       during the first 30 seconds of a non-exempt BUY the opening tax on top (99% total at the start, linear to the
       normal fee at +30 s, the rate read from the protection module).
-    - the immutable protection module (LaunchProtectionModuleV1, CREATE child 2) authenticates every buy in the first
+    - the immutable protection module (BaseLaunchProtectionModuleV1, CREATE child 2) authenticates every buy in the first
       300 seconds (a runtime-pinned router's msgSender(), or the initializer's atomic initial buy naming the
       developer) and sets the opening tax; this kernel binds both to its single active swap, checks the module's
       code hash on every call, and limits each authenticated buyer to the token's walletTokenLimit (2%) of
@@ -112,15 +112,14 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     }
 
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
-    // Permit2, the canonical universal approval conduit, same address on every chain (9,152 bytes on chain 1).
+    // Permit2, the canonical universal approval conduit, same address on every chain (9,152 bytes on Base).
     address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
-    // Ethereum mainnet infrastructure that may hold or route DRAW without ever being a hand on the street.
-    address internal constant UNIVERSAL_ROUTER = 0x66a9893cC07D91D95644AEDD05D03f95e1dBA8Af;   // Uniswap, v4-aware
-    address internal constant UNIVERSAL_ROUTER_2 = 0x4C82D1fBFe28C977cBB58D8C7FF8FCF9F70a2cCA; // older, still used by front ends
-    address internal constant POSITION_MANAGER = 0xbD216513d74C8cf14cf4747E6AaA6420FF64ee9e;   // Uniswap v4 PositionManager
-    address internal constant PROGRAMMABLE_ROUTER = 0xd92A36B0000531EF3063dEd4De20A0783308446C; // Programmable's trading router
-    address internal constant GRAPH_FACTORY = 0xB012e4A8F2c5FC4E8E4faCA9D5Ad6FfF13FBA887;       // Programmable's Graph Factory
-    address internal constant ROUTER_24H = 0xBE4bF6Ac8c6F012E1C8f25747A9fBccB2FDAC4C3;          // Programmable's 24h Router
+    // Base (chain 8453) Uniswap infrastructure that may hold or route DRAW without ever being a hand on the street.
+    // Programmable's trading router is the `router` constructor argument (excluded below); its Graph Factory and
+    // 24h Router come in through `exclusions`.
+    address internal constant UNIVERSAL_ROUTER = 0x6fF5693b99212Da76ad316178A184AB56D299b43;   // Uniswap, v4-aware
+    address internal constant UNIVERSAL_ROUTER_2 = 0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD; // older, still used by front ends
+    address internal constant POSITION_MANAGER = 0x7C5f5A4bBd8fD63184577525326123B519429bDc;   // Uniswap v4 PositionManager
     uint256 internal constant SUPPLY = 100_000e18; // QuickdrawToken.SUPPLY: 100k DRAW, minted once; the caps are shares of it
 
     // QUICKDRAW-1 self-description: any tracker can recognize the game generically (ERC-165 below)
@@ -149,13 +148,14 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     // one draw, so the street keeps moving at any market cap.
     uint256 public constant EAT_UNIT    = 0.05 ether;
     uint8   internal constant MAX_DRAIN   = 4;       // max deferred draws armed/resolved per swap (bounded catch-up)
-    // COMMIT->REVEAL delay in WALL-CLOCK SECONDS. An Ethereum slot is 12s, so this is "an armed draw resolves a
-    // block later", expressed in seconds so it degrades gracefully across missed slots. The separation guarantee
-    // itself comes from the BLOCK gate in _resolveEats, not from this number.
+    // COMMIT->REVEAL delay in WALL-CLOCK SECONDS: the game's round. A Base block is 2s, but the owner keeps the
+    // Ethereum pace (2026-10-20): a round of draws settles at least 12 s (about 6 Base blocks) after it was armed,
+    // never every block. Arming keeps re-pinning the batch until MAX_DRAIN draws wait, so at most one round of up to
+    // four draws settles per 12 s. The seed is still the ARMING block's hash; waiting longer changes nothing.
     uint32  internal constant REVEAL_DELAY    = 12;
-    // Armed draws older than this are DROPPED rather than resolved on stale flow. On Ethereum 10 minutes is
-    // ~50 blocks, comfortably inside the 256-block (~51 min) blockhash window the reveal seed reads from.
-    uint32  internal constant EAT_STALE_AFTER = 10 minutes;
+    // Armed draws older than this are DROPPED rather than resolved on stale flow. On Base 8 minutes is
+    // ~240 blocks, inside the 256-block (~8.5 min at 2s) blockhash window the reveal seed reads from.
+    uint32  internal constant EAT_STALE_AFTER = 8 minutes;
     // Launch anti-snipe caps, ON TOP of the token's protected-launch budget: two guards on INCOMING transfers,
     // checked by the token through beforeTokenTransfer. Neither can touch a draw: a draw moves balance RAW through
     // gameMove/gameBurn, never through transfer(), so a hand growing past a cap by WINNING is always allowed.
@@ -272,7 +272,8 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     /// `developer` is the launch wallet (the initial buyer, exempt from the opening tax); `exemptWallets` are up to
     /// six more wallets exempt from the opening tax ONLY, zero for an unused slot. `capAdmin_` is the ONLY post-launch
     /// privileged address. `renderer_` draws the NFT art. `exclusions` are extra addresses that may hold DRAW
-    /// without being a hand (the mainnet infrastructure is baked in below).
+    /// without being a hand (the Base Uniswap infrastructure is baked in below; Programmable's Graph Factory and
+    /// 24h Router come in here).
     constructor(
         IPoolManager manager,
         PoolConfig memory config,
@@ -288,9 +289,9 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         poolManager = manager;
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
         CHAIN_ID = block.chainid;
-        CANONICAL_POOL_MANAGER = 0x000000000004444c5dc75cB358380D2e3dE08A90;
+        CANONICAL_POOL_MANAGER = 0x498581fF718922c3f8e6A244956aF099B2652b2b; // Uniswap v4 PoolManager, Base
         if (
-            block.chainid != 1 || address(manager) != CANONICAL_POOL_MANAGER || address(manager).code.length == 0
+            block.chainid != 8453 || address(manager) != CANONICAL_POOL_MANAGER || address(manager).code.length == 0
                 || config.lpFee != 0 || config.tickSpacing != 60 || config.module != address(0)
                 || config.creatorBuyFeeBps != CREATOR_FEE_BPS || config.creatorSellFeeBps != CREATOR_FEE_BPS
                 || config.token == address(0) || config.initializer == address(0)
@@ -317,7 +318,7 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         IQuickdrawToken(config.token).bindGame();
         // the normal fee vault as CREATE child 1, as in ProtectedNative30HookV1
         feeVault = new EthereumNativeFeeVaultV3(manager, config.creatorFeeRecipient);
-        LaunchProtectionModuleV1 protection = new LaunchProtectionModuleV1(
+        BaseLaunchProtectionModuleV1 protection = new BaseLaunchProtectionModuleV1(
             address(this),
             ProtectedLaunchTokenV1(config.token),
             developer,
@@ -345,9 +346,7 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         isExcluded[UNIVERSAL_ROUTER] = true;
         isExcluded[UNIVERSAL_ROUTER_2] = true;
         isExcluded[POSITION_MANAGER] = true;
-        isExcluded[PROGRAMMABLE_ROUTER] = true;
-        isExcluded[GRAPH_FACTORY] = true;
-        isExcluded[ROUTER_24H] = true;
+        isExcluded[router] = true;                      // Programmable's trading router (the module pins it)
         for (uint256 i = 0; i < exclusions.length; i++) isExcluded[exclusions[i]] = true;
     }
 
@@ -388,7 +387,7 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         view
         returns (uint256 gross, uint256 platformFee, uint256 creatorFee, uint256 openingTax)
     {
-        uint24 taxPpm = isBuy ? LaunchProtectionModuleV1(module).additionalTaxPpmForBuyer(buyer) : 0;
+        uint24 taxPpm = isBuy ? BaseLaunchProtectionModuleV1(module).additionalTaxPpmForBuyer(buyer) : 0;
         return _quoteTradeFees(amount, amountIsNet, isBuy, taxPpm);
     }
 
@@ -421,8 +420,13 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     // the internal callback); the other seven revert, as BaseHook's do.
 
     modifier onlyPoolManager() {
-        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        _onlyPoolManager();
         _;
+    }
+
+    /// One shared body for the check, so the ten callbacks that carry onlyPoolManager do not each inline it.
+    function _onlyPoolManager() private view {
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
     }
 
     function beforeInitialize(address sender, PoolKey calldata key, uint160 sqrtPriceX96)
@@ -451,13 +455,13 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         return _afterSwap(sender, key, params, delta, hookData);
     }
 
-    function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) { revert HookNotImplemented(); }
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata) external pure returns (bytes4) { revert HookNotImplemented(); }
-    function afterAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata) external pure returns (bytes4, BalanceDelta) { revert HookNotImplemented(); }
-    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata) external pure returns (bytes4) { revert HookNotImplemented(); }
-    function afterRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata) external pure returns (bytes4, BalanceDelta) { revert HookNotImplemented(); }
-    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) { revert HookNotImplemented(); }
-    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) { revert HookNotImplemented(); }
+    function afterInitialize(address, PoolKey calldata, uint160, int24) external view onlyPoolManager returns (bytes4) { revert HookNotImplemented(); }
+    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata) external view onlyPoolManager returns (bytes4) { revert HookNotImplemented(); }
+    function afterAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata) external view onlyPoolManager returns (bytes4, BalanceDelta) { revert HookNotImplemented(); }
+    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata) external view onlyPoolManager returns (bytes4) { revert HookNotImplemented(); }
+    function afterRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata) external view onlyPoolManager returns (bytes4, BalanceDelta) { revert HookNotImplemented(); }
+    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external view onlyPoolManager returns (bytes4) { revert HookNotImplemented(); }
+    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external view onlyPoolManager returns (bytes4) { revert HookNotImplemented(); }
 
     function _beforeInitialize(address sender, PoolKey calldata key, uint160 price) internal returns (bytes4) {
         _requirePool(key);
@@ -478,9 +482,9 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         activeSwap = keccak256(abi.encode(sender, key, params, data));
         overrideFee = _beforeModule(sender, key, params, data);
         if (params.zeroForOne && block.timestamp < IQuickdrawToken(token).startedAt() + PROTECTION_SECONDS) {
-            activeBuyer = LaunchProtectionModuleV1(module).protectedBuyer(sender);
+            activeBuyer = BaseLaunchProtectionModuleV1(module).protectedBuyer(sender);
         }
-        activeOpeningTaxPpm = params.zeroForOne ? LaunchProtectionModuleV1(module).openingTaxPpmForSender(sender) : 0;
+        activeOpeningTaxPpm = params.zeroForOne ? BaseLaunchProtectionModuleV1(module).openingTaxPpmForSender(sender) : 0;
         bool nativeIsSpecified = params.zeroForOne == (params.amountSpecified < 0);
         if (!nativeIsSpecified) return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, overrideFee);
         uint256 nativeAmount = _absolute(params.amountSpecified);
@@ -901,13 +905,12 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     /// THE SEED IS PINNED TO THE COMMIT, NOT TO THE REVEAL. Once the arming block seals, the outcome is FIXED:
     /// waiting changes nothing, extra swaps change nothing, the only choice left is resolve or don't resolve, and
     /// declining just leaves the draws for the next trader's swap (or for the staleness drop). The proposer of
-    /// the ARMING block keeps one shot at biasing a draw armed inside it (the standard floor for on-chain
-    /// randomness without a VRF); the seed only randomises SELECTION AMONG bucket occupants, the percentage floor
+    /// the ARMING block (on Base, the sequencer) keeps one shot at biasing a draw armed inside it (the standard floor
+    /// for on-chain randomness without a VRF); the seed only randomises SELECTION AMONG bucket occupants, the percentage floor
     /// and KILL_COOLDOWN cap the payoff, and 95% of taken mass is burned.
     ///
-    /// BLOCK TIME: an Ethereum slot is 12s, so the two reveal gates below (>= 12s of wall clock, and a strictly
-    /// later block) land on the SAME block, the next one. The block gate is what guarantees
-    /// `blockhash(eatCommitBlock)` is readable at all; REVEAL_DELAY is only a floor.
+    /// BLOCK TIME: a Base block is 2s and REVEAL_DELAY is 12s, so a round settles about 6 blocks after its arming
+    /// block. The block gate is what guarantees `blockhash(eatCommitBlock)` is readable at all.
     function _resolveEats() internal {
         uint256 pe = pendingEats;
         if (pe == 0) return;
@@ -917,7 +920,7 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         if (liveMass == 0) return; // nothing to draw on; drop the armed draws
         // staleness: after a long idle gap, drop the armed draws instead of resolving on stale flow.
         if (block.timestamp > uint256(eatCommitTs) + EAT_STALE_AFTER) return;
-        // seal := hash of the block the draws were armed in. EAT_STALE_AFTER (10 min ~= 50 blocks) keeps this well
+        // seal := hash of the block the draws were armed in. EAT_STALE_AFTER (8 min ~= 240 Base blocks) keeps this
         // inside the 256-block blockhash window, so the zero-guard below should be unreachable, but a zero seal
         // would make every draw deterministic, so it is checked rather than assumed.
         bytes32 seal = blockhash(uint256(eatCommitBlock));

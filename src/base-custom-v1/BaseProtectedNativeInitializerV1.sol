@@ -10,8 +10,8 @@ import { ModifyLiquidityParams, SwapParams } from "@uniswap/v4-core/src/types/Po
 import { TickMath } from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import { FullMath } from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import { SafeERC20, IERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import { ProtectedLaunchTokenV1 } from "./ProtectedLaunchTokenV1.sol";
-import { LaunchProtectionModuleV1 } from "./LaunchProtectionModuleV1.sol";
+import { ProtectedLaunchTokenV1 } from "../launch-protection/ProtectedLaunchTokenV1.sol";
+import { BaseLaunchProtectionModuleV1 } from "./BaseLaunchProtectionModuleV1.sol";
 
 interface IProtectedLaunchHookV1 {
     function poolKey() external view returns (PoolKey memory);
@@ -25,9 +25,10 @@ interface ILaunchUsdFeedV1 {
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80);
 }
 
+/// @dev Base-only adapter of the existing launch-protection implementation.
 /// @notice Atomic seed plus capped initial purchase, with an independent USD opening-price check.
 /// @dev There is no remove-liquidity, collect-fees, execute, upgrade or owner-withdrawal entry point.
-contract ProtectedNativeInitializerV1 is IUnlockCallback {
+contract BaseProtectedNativeInitializerV1 is IUnlockCallback {
     using SafeERC20 for IERC20;
     uint256 public constant MINIMUM_FDV_USD = 15_000;
     uint256 public immutable MAX_FEED_AGE;
@@ -35,6 +36,9 @@ contract ProtectedNativeInitializerV1 is IUnlockCallback {
     IPoolManager public immutable poolManager;
     ILaunchUsdFeedV1 public immutable nativeUsdFeed;
     bytes32 public immutable feedCodeHash;
+    address public constant SEQUENCER_FEED = 0xBCF85224fc0756B9Fa45aA7892530B47e10b6433;
+    uint256 public constant SEQUENCER_GRACE_SECONDS = 1 hours;
+    bytes32 public immutable sequencerFeedCodeHash;
     uint8 public immutable feedDecimals;
     bool public initialized;
     uint128 public lockedLiquidity;
@@ -59,24 +63,22 @@ contract ProtectedNativeInitializerV1 is IUnlockCallback {
     );
 
     constructor(IPoolManager manager_, address graphFactory_, ILaunchUsdFeedV1 feed_, bytes32 expectedFeedCodeHash) {
-        address canonicalFeed = block.chainid == 1
-            ? 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419
-            : block.chainid == 4663 ? 0x78F3556b67E17Df817D51Ef5a990cDaF09E8d3A9 : address(0);
-        address canonicalManager = block.chainid == 1
-            ? 0x000000000004444c5dc75cB358380D2e3dE08A90
-            : block.chainid == 4663 ? 0x8366a39CC670B4001A1121B8F6A443A643e40951 : address(0);
+        address canonicalFeed = 0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
+        address canonicalManager = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
         if (
-            canonicalFeed == address(0) || address(feed_) != canonicalFeed || address(manager_) != canonicalManager
+            block.chainid != 8453 || address(feed_) != canonicalFeed || address(manager_) != canonicalManager
                 || address(manager_).code.length == 0 || graphFactory_ == address(0) || address(feed_).code.length == 0
                 || address(feed_).codehash != expectedFeedCodeHash
         ) {
             revert InvalidConfiguration();
         }
+        if (SEQUENCER_FEED.code.length == 0) revert InvalidConfiguration();
+        sequencerFeedCodeHash = SEQUENCER_FEED.codehash;
         uint8 decimals_ = feed_.decimals();
         if (decimals_ > 18) revert InvalidConfiguration();
         poolManager = manager_;
         // Bound to the published heartbeat of the fixed feed, not an applicant-supplied tolerance.
-        MAX_FEED_AGE = block.chainid == 1 ? 1 hours : 24 hours;
+        MAX_FEED_AGE = 1 hours;
         graphFactory = graphFactory_;
         nativeUsdFeed = feed_;
         feedCodeHash = expectedFeedCodeHash;
@@ -93,7 +95,7 @@ contract ProtectedNativeInitializerV1 is IUnlockCallback {
         if (msg.sender != graphFactory) revert Unauthorized();
         if (initialized) revert AlreadyInitialized();
         PoolKey memory key = hook.poolKey();
-        LaunchProtectionModuleV1 protection = LaunchProtectionModuleV1(hook.module());
+        BaseLaunchProtectionModuleV1 protection = BaseLaunchProtectionModuleV1(hook.module());
         if (
             hook.initializer() != address(this) || token.initializer() != address(this)
                 || token.poolManager() != address(poolManager) || Currency.unwrap(key.currency0) != address(0)
@@ -120,7 +122,14 @@ contract ProtectedNativeInitializerV1 is IUnlockCallback {
     }
 
     function _openingFdv(uint256 supply, uint160 sqrtPriceX96) private view returns (uint256) {
-        if (address(nativeUsdFeed).codehash != feedCodeHash) revert InvalidOraclePrice();
+        if (address(nativeUsdFeed).codehash != feedCodeHash || SEQUENCER_FEED.codehash != sequencerFeedCodeHash) {
+            revert InvalidOraclePrice();
+        }
+        (, int256 sequencerStatus, uint256 startedAt,,) = ILaunchUsdFeedV1(SEQUENCER_FEED).latestRoundData();
+        if (
+            sequencerStatus != 0 || startedAt == 0 || startedAt > block.timestamp
+                || block.timestamp - startedAt <= SEQUENCER_GRACE_SECONDS
+        ) revert InvalidOraclePrice();
         (uint80 round, int256 answer,, uint256 updated, uint80 answeredRound) = nativeUsdFeed.latestRoundData();
         if (
             answer <= 0 || updated == 0 || updated > block.timestamp || block.timestamp - updated > MAX_FEED_AGE
@@ -138,7 +147,8 @@ contract ProtectedNativeInitializerV1 is IUnlockCallback {
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
-        if (msg.sender != address(poolManager) || _callback == bytes32(0) || keccak256(data) != _callback) {
+        if (msg.sender != address(poolManager)) revert Unauthorized();
+        if (_callback == bytes32(0) || keccak256(data) != _callback) {
             revert Unauthorized();
         }
         _callback = bytes32(0);

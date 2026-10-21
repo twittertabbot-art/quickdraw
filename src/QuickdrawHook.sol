@@ -420,13 +420,8 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     // the internal callback); the other seven revert, as BaseHook's do.
 
     modifier onlyPoolManager() {
-        _onlyPoolManager();
-        _;
-    }
-
-    /// One shared body for the check, so the ten callbacks that carry onlyPoolManager do not each inline it.
-    function _onlyPoolManager() private view {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
+        _;
     }
 
     function beforeInitialize(address sender, PoolKey calldata key, uint160 sqrtPriceX96)
@@ -455,13 +450,13 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         return _afterSwap(sender, key, params, delta, hookData);
     }
 
-    function afterInitialize(address, PoolKey calldata, uint160, int24) external view onlyPoolManager returns (bytes4) { revert HookNotImplemented(); }
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata) external view onlyPoolManager returns (bytes4) { revert HookNotImplemented(); }
-    function afterAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata) external view onlyPoolManager returns (bytes4, BalanceDelta) { revert HookNotImplemented(); }
-    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata) external view onlyPoolManager returns (bytes4) { revert HookNotImplemented(); }
-    function afterRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata) external view onlyPoolManager returns (bytes4, BalanceDelta) { revert HookNotImplemented(); }
-    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external view onlyPoolManager returns (bytes4) { revert HookNotImplemented(); }
-    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external view onlyPoolManager returns (bytes4) { revert HookNotImplemented(); }
+    function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) { revert HookNotImplemented(); }
+    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata) external pure returns (bytes4) { revert HookNotImplemented(); }
+    function afterAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata) external pure returns (bytes4, BalanceDelta) { revert HookNotImplemented(); }
+    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata) external pure returns (bytes4) { revert HookNotImplemented(); }
+    function afterRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata) external pure returns (bytes4, BalanceDelta) { revert HookNotImplemented(); }
+    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) { revert HookNotImplemented(); }
+    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) { revert HookNotImplemented(); }
 
     function _beforeInitialize(address sender, PoolKey calldata key, uint160 price) internal returns (bytes4) {
         _requirePool(key);

@@ -61,18 +61,20 @@ interface IProtectedNativeFeeModuleV1 {
       ceil(gross * 30 / 10000), the normal total ceil(gross * 430 / 10000) (PLATFORM_FEE_BPS + CREATOR_FEE_BPS), and
       during the first 30 seconds of a non-exempt BUY the opening tax on top (99% total at the start, linear to the
       normal fee at +30 s, the rate read from the protection module).
-    - LAUNCH TAX (the one addition to the kernel's fee path): for the first 300 seconds every BUY, from every buyer
-      (the developer's initial buy and the exempt wallets included), pays the creator a launch tax on top of the
-      normal fee, sized so that the opening tax and the launch tax together come to 30% of the gross: while the
-      module's opening tax is 30% or more nothing is added; below it the launch tax tops it up to 30%. In all a buy
-      pays at most 99% (the opening schedule's start) and, once the opening tax is under 30%, 34.3% until +300 s.
-      Sells never pay it. It is funded, all of it, into the normal vault's creator ledger (the treasury), never into
-      the bounty, and when the opening tax applies too, the opening tax keeps exactly its own rate.
+    - LAUNCH FEE (the one addition to the kernel's fee path, under the owner exception Programmable authorized on
+      2026-10-22): for the first 120 seconds (PROTECTION_SECONDS) every trade, buy or sell, from every wallet (the
+      developer's initial buy and the exempt wallets included), pays at least LAUNCH_FEE_PPM (30%) of the gross in
+      total, the 0.3% platform fee included. When the opening tax alone already makes a buy cost more (its first
+      seconds), the buy pays the reference's fee unchanged; otherwise a launch tax tops the total up to 30%. Inside
+      those 120 seconds everything but the platform fee and the opening tax is the treasury's (the normal vault's
+      creator ledger): the creator fee and the launch tax, with no bounty share. After 120 seconds every fee is the
+      reference's again (4.3%: 0.3% platform, 2.5% treasury, 1.5% bounty). The opening tax keeps exactly its own rate
+      and its own vault.
     - the immutable protection module (LaunchProtectionModuleV1, CREATE child 2) authenticates every buy in the first
-      300 seconds (a runtime-pinned router's msgSender(), or the initializer's atomic initial buy naming the
+      120 seconds (a runtime-pinned router's msgSender(), or the initializer's atomic initial buy naming the
       developer) and sets the opening tax; this kernel binds both to its single active swap, checks the module's
       code hash on every call, and limits each authenticated buyer to the token's walletTokenLimit (2%) of
-      cumulative purchases in those 300 seconds (boughtDuringProtection), so redirecting delivery cannot multiply
+      cumulative purchases in those 120 seconds (boughtDuringProtection), so redirecting delivery cannot multiply
       one buyer's allowance.
     - CUSTODY, segregated: the platform fee, the dev's 2.5% and the launch tax are funded as native ERC-6909 claims of the normal
       fee vault (EthereumNativeFeeVaultV3, CREATE child 1: platform ledger -> PLATFORM_RECIPIENT, creator ledger ->
@@ -172,10 +174,11 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
     uint16  public constant MAX_WALLET_BPS = 200;        // 2% of supply (2,000 DRAW)
     // The protection window of the token and the module (ProtectedLaunchTokenV1.PROTECTION_SECONDS): inside it the
     // caps bind every recipient, exclusions included, and neither cap can be removed.
-    uint256 internal constant PROTECTION_SECONDS = 300;
-    // LAUNCH TAX (owner, 2026-10-22): during those 300 seconds the opening tax and the launch tax together come to at
-    // least this share of a buy's gross, in ppm (30%); the launch tax is the creator's (the treasury). See THE KERNEL.
-    uint256 public constant LAUNCH_TAX_PPM = 300_000;
+    // 120 seconds under the owner exception Programmable authorized on 2026-10-22 (the reference's 300).
+    uint256 internal constant PROTECTION_SECONDS = 120;
+    // LAUNCH FEE: during those 120 seconds every trade pays at least this share of its gross in total (30%, in ppm),
+    // the platform fee included; all of it but the platform fee and the opening tax is the treasury's. See THE KERNEL.
+    uint256 public constant LAUNCH_FEE_PPM = 300_000;
 
     // ---- the kernel (ProtectedNative30HookV1's immutables and swap context) ----
     address public immutable token;
@@ -236,7 +239,8 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         uint256 creatorFee
     );
     event OpeningTaxAccrued(bytes32 indexed poolId, address indexed sender, uint256 grossNative, uint256 amount);
-    /// The launch tax of one buy (part of NativeFeesAccrued's creatorFee, all of it on the treasury's ledger).
+    /// The launch tax of one trade in the first 120 seconds: what tops its fee up to LAUNCH_FEE_PPM (part of
+    /// NativeFeesAccrued's creatorFee, all of it on the treasury's ledger).
     event LaunchTaxAccrued(bytes32 indexed poolId, address indexed sender, uint256 grossNative, uint256 amount);
     event BountySwept(uint256 amount);  // capAdmin moved the whole standing bounty to the treasury (dev wallet)
     event EthReclaimed(uint256 indexed id, address indexed owner, uint256 amount); // won ETH unclaimed past the window -> treasury
@@ -413,8 +417,8 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         devFee = creatorFee - bountyFee;
     }
 
-    /// `taxPpm` is the module's opening rate for this buy. The launch tax tops opening + launch up to LAUNCH_TAX_PPM for
-    /// a buy in the first 300 seconds. The extra over the normal fee is the opening tax alone when there is no launch
+    /// `taxPpm` is the module's opening rate for this buy. In the first 120 seconds the launch tax tops a trade's total
+    /// fee up to LAUNCH_FEE_PPM (buys and sells). The extra over the normal fee is the opening tax alone when there is no launch
     /// tax (the reference's maths exactly), the launch tax alone when there is no opening tax, and otherwise the
     /// opening tax at exactly its own rate (rounded down) with the launch tax taking the rest.
     /// One trade's fees, all in wei of the native leg (one memory struct: five loose values overflow the stack).
@@ -424,6 +428,7 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         uint256 creatorFee;
         uint256 openingTax;
         uint256 launchTax;
+        bool window; // within PROTECTION_SECONDS of the start: the creator fee is all the treasury's, no bounty share
     }
 
     function _quoteTradeFees(uint256 amount, bool amountIsNet, bool isBuy, uint24 taxPpm)
@@ -432,11 +437,11 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         returns (TradeFees memory f)
     {
         uint256 normalPpm = (PLATFORM_FEE_BPS + uint256(isBuy ? creatorBuyFeeBps : creatorSellFeeBps)) * 100;
-        // with a launch tax, opening + launch is exactly LAUNCH_TAX_PPM; without one, the extra is the opening rate
+        // in the window a total under LAUNCH_FEE_PPM is topped up to it (a launch tax); otherwise the extra over the
+        // normal fee is the opening rate alone
+        f.window = block.timestamp < IQuickdrawToken(token).startedAt() + PROTECTION_SECONDS;
         uint256 extraPpm = taxPpm;
-        if (isBuy && taxPpm < LAUNCH_TAX_PPM && block.timestamp < IQuickdrawToken(token).startedAt() + PROTECTION_SECONDS) {
-            extraPpm = LAUNCH_TAX_PPM;
-        }
+        if (f.window && normalPpm + taxPpm < LAUNCH_FEE_PPM) extraPpm = LAUNCH_FEE_PPM - normalPpm;
         if (normalPpm + extraPpm >= 1_000_000) revert InvalidConfiguration();
         f.gross = amountIsNet
             ? Math.mulDiv(amount, 1_000_000, 1_000_000 - normalPpm - extraPpm, Math.Rounding.Ceil)
@@ -625,8 +630,8 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         _accrue(sender, isBuy, f);
     }
 
-    /// The kernel's accrual, with the creator fee split: the platform fee and the dev's share (plus all of the launch
-    /// tax) funded as native ERC-6909 claims of the normal vault and recorded on its two ledgers; the opening tax funded
+    /// The kernel's accrual, with the creator fee split (after the first 120 s; inside them all of it is the treasury's):
+    /// the platform fee and the dev's share (plus all of the launch tax) funded as native ERC-6909 claims of the normal vault and recorded on its two ledgers; the opening tax funded
     /// and recorded in the opening-tax vault (platform ledger only); the game's bounty share taken here as native ETH
     /// into bountyPool.
     function _accrue(address sender, bool isBuy, TradeFees memory f) private {
@@ -636,6 +641,7 @@ contract QuickdrawHook is QuickdrawGame, IHooks {
         uint256 launchTax = f.launchTax;
         bytes32 poolId = keccak256(abi.encode(poolKey())); // the bound key (_requirePool): the swap's own
         (uint256 devFee, uint256 bountyFee) = creatorFeeSplit(f.creatorFee);
+        if (f.window) (devFee, bountyFee) = (f.creatorFee, 0); // the first 120 s: the whole creator fee is the treasury's
         devFee += launchTax; // the launch tax is the treasury's, none of it to the bounty
         uint256 vaulted = platformFee + devFee;
         _int128(vaulted);

@@ -25,17 +25,21 @@ OpenZeppelin sources the contracts import.
 
 ## Launch protection
 
-For the first 300 seconds after launch, every wallet may receive at most 2% of the supply and every authenticated buyer
-may buy at most 2%, counted cumulatively. Buys during that window go through Programmable's router. The buy fee opens
+For the first 120 seconds after launch (the standard window is 300; Programmable authorized the shorter one for this
+launch), every wallet may receive at most 2% of the supply and every authenticated buyer may buy at most 2%, counted
+cumulatively. Buys during that window go through Programmable's router. The buy fee opens
 at 99% and falls linearly to the normal fee over 30 seconds; the extra goes to the opening-tax vault, payable only to
 Programmable's treasury. The pool opens only at a value of at least $15,000, checked against the Chainlink ETH/USD
 feed.
 
-For the same first 300 seconds every buy also pays a launch tax to the Quickdraw treasury: together with the opening
-fee it comes to at least 30% of the buy on top of the normal fee (34.3% in all once the opening fee is under 30%).
-Everyone pays it, the developer's initial buy and the team's buys included, it is booked in the normal fee vault's
-creator ledger, and the opening fee keeps exactly its own rate and vault. Sells never pay it. The rule is the `LAUNCH
-TAX` section of `QuickdrawHook.sol` (`LAUNCH_TAX_PPM`, event `LaunchTaxAccrued`).
+For the same first 120 seconds every trade, buy or sell, pays a launch fee of 30% in all, the 0.3% platform fee
+included. Everything but the platform fee goes to the Quickdraw treasury (the normal fee vault's creator ledger), with
+no share for the bounty. Everyone pays it, the developer's initial buy and the team's trades included. While the
+opening fee alone makes a buy cost more (its first seconds), the buy pays that fee unchanged; otherwise a launch tax
+tops the total up to 30%, and the opening fee keeps exactly its own rate and vault. From 120 seconds on every trade
+pays the normal 4.3%. The 0.5% max transaction and 2% max wallet stay until the team removes them (`removeMaxTx`,
+`removeMaxWallet`, one-way, not before 120 seconds). The rule is the `LAUNCH FEE` section of `QuickdrawHook.sol`
+(`LAUNCH_FEE_PPM`, event `LaunchTaxAccrued`).
 
 ## Build settings
 

@@ -18,7 +18,7 @@ interface IQuickdrawGame {
 
   THE LAUNCH PROTECTION SURFACE, with the semantics of Programmable's ProtectedLaunchTokenV1 (the initializer and the
   protection module read it): initializer(), poolManager(), launchSupply(), walletTokenLimit(), startedAt(), start()
-  (the initializer only, once), receivedDuringProtection(address), WALLET_LIMIT_BPS 200, PROTECTION_SECONDS 300,
+  (the initializer only, once), receivedDuringProtection(address), WALLET_LIMIT_BPS 200, PROTECTION_SECONDS 120,
   POLICY_REVISION 2.
     - Before start() only the initializer's seeding moves inventory, and only to the PoolManager.
     - For PROTECTION_SECONDS after start() every recipient except the PoolManager has a CUMULATIVE inflow budget of
@@ -51,7 +51,7 @@ contract QuickdrawToken is ERC20 {
     uint256 public constant SUPPLY = 100_000e18;
     uint256 public constant POLICY_REVISION = 2;
     uint256 public constant WALLET_LIMIT_BPS = 200;
-    uint256 public constant PROTECTION_SECONDS = 300;
+    uint256 public constant PROTECTION_SECONDS = 120; // the owner exception Programmable authorized on 2026-10-22 (the reference's 300)
     address public immutable initializer; // ProtectedNativeInitializerV1: holds the supply until it seeds the pool
     address public immutable poolManager; // Uniswap v4 PoolManager: the settlement side, outside the inflow budget
     uint256 public immutable launchSupply; // SUPPLY

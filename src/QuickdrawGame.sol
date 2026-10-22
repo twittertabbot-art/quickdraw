@@ -67,7 +67,7 @@ abstract contract QuickdrawGame {
     uint16  internal constant BOUNTY_DRAW_BPS  = 2000; // a kill drinks 20% of the STANDING bounty pool (self-limiting)
     uint16  internal constant ETH_INHERIT_BPS  = 7000; // 70% of the prey's banked ETH -> predator
     uint16  internal constant ETH_SPORE_BPS    = 1000; // 10% of the prey's banked ETH -> prey owner (pull); rest recycles
-    // WALL-CLOCK: timestamp-based, so it never depends on block pacing (about 180 Base blocks).
+    // WALL-CLOCK: timestamp-based, so it never depends on block pacing (about 30 Ethereum blocks).
     uint64  internal constant KILL_COOLDOWN    = 6 minutes; // a predator waits this long before drawing the bounty again
     // POST-EAT SHIELD: a hand that is eaten becomes un-eatable for this long. Keyed to its address (handId) and
     // written ONLY in `_eat` — never in `_resync` — so it SURVIVES buys and sells (a trade can never clear it).

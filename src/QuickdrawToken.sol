@@ -12,7 +12,7 @@ interface IQuickdrawGame {
 }
 
 /*
-  DRAW, the coin. 100,000, minted once to the launch initializer (Programmable's BaseProtectedNativeInitializerV1),
+  DRAW, the coin. 100,000, minted once to the launch initializer (Programmable's ProtectedNativeInitializerV1),
   which seeds all of it into the pool and locks it there. No owner, no mint after construction, no pause, no fee
   inside the token, no setter of any kind.
 
@@ -52,7 +52,7 @@ contract QuickdrawToken is ERC20 {
     uint256 public constant POLICY_REVISION = 2;
     uint256 public constant WALLET_LIMIT_BPS = 200;
     uint256 public constant PROTECTION_SECONDS = 300;
-    address public immutable initializer; // BaseProtectedNativeInitializerV1: holds the supply until it seeds the pool
+    address public immutable initializer; // ProtectedNativeInitializerV1: holds the supply until it seeds the pool
     address public immutable poolManager; // Uniswap v4 PoolManager: the settlement side, outside the inflow budget
     uint256 public immutable launchSupply; // SUPPLY
     uint256 public immutable walletTokenLimit; // 2% of launchSupply: the cumulative inflow budget in the window

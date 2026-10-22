@@ -7,17 +7,16 @@ import { SwapParams } from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import { BalanceDelta } from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import { BeforeSwapDelta, BeforeSwapDeltaLibrary } from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
-import { ProtectedLaunchTokenV1 } from "../launch-protection/ProtectedLaunchTokenV1.sol";
+import { ProtectedLaunchTokenV1 } from "./ProtectedLaunchTokenV1.sol";
 
 interface ILaunchProtectionRouterV1 {
     function msgSender() external view returns (address);
 }
 
-/// @dev Base-only adapter of the existing launch-protection implementation.
 /// @notice Immutable opening-tax policy for the sealed launch kernel.
 /// @dev Total buy fee starts at 99% and falls linearly to normal fees over thirty seconds.
 /// The kernel separately accounts for opening taxes payable only to the fixed platform treasury.
-contract BaseLaunchProtectionModuleV1 {
+contract LaunchProtectionModuleV1 {
     uint256 public constant OPENING_TOTAL_PPM = 990_000;
     uint256 public constant DECAY_SECONDS = 30;
 
@@ -44,12 +43,14 @@ contract BaseLaunchProtectionModuleV1 {
         uint16 creatorBuyFeeBps_,
         address[6] memory exemptWallets_
     ) {
-        address canonicalRouter = 0xd6145b2D3F379919E8CdEda7B97e37c4b2Ca9c40;
+        address canonicalRouter = block.chainid == 1
+            ? 0xd92A36B0000531EF3063dEd4De20A0783308446C
+            : 0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99;
         if (
             kernel_ == address(0) || address(token_).code.length == 0 || developer_ == address(0)
                 || developer_ == address(token_) || developer_ == token_.poolManager() || router_.code.length == 0
-                || block.chainid != 8453 || router_ != canonicalRouter || router_.codehash != routerCodeHash_
-                || creatorBuyFeeBps_ > 1000
+                || (block.chainid != 1 && block.chainid != 4663) || router_ != canonicalRouter
+                || router_.codehash != routerCodeHash_ || creatorBuyFeeBps_ > 1000
         ) revert InvalidConfiguration();
         for (uint256 i; i < exemptWallets_.length; ++i) {
             address wallet = exemptWallets_[i];
